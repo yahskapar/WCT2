@@ -38,6 +38,16 @@ def open_image(image_path, image_size=None):
     transform = transforms.Compose(_transforms)
     return transform(image).unsqueeze(0)
 
+def transform_ubfc_image(image, image_size=None):
+    _transforms = []
+    if image_size is not None:
+        image = transforms.Resize(image_size)(image)
+        # _transforms.append(transforms.Resize(image_size))
+    w, h = image.size
+    _transforms.append(transforms.CenterCrop((h // 16 * 16, w // 16 * 16)))
+    _transforms.append(transforms.ToTensor())
+    transform = transforms.Compose(_transforms)
+    return transform(image).unsqueeze(0)
 
 def change_seg(seg):
     color_dict = {
@@ -74,10 +84,10 @@ def change_seg(seg):
     return new_seg.astype(np.uint8)
 
 
-def load_segment(image_path, image_size=None):
-    if not image_path:
-        return np.asarray([])
-    image = Image.open(image_path)
+def load_segment(seg_mask, image_size=None):
+    if not seg_mask:
+        print("Something is wrong!")
+    image = seg_mask
     if image_size is not None:
         transform = transforms.Resize(image_size, interpolation=Image.NEAREST)
         image = transform(image)

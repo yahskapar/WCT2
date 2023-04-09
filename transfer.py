@@ -21,16 +21,21 @@ THE SOFTWARE.
 """
 
 import os
-import tqdm
+from tqdm import tqdm
 import argparse
+import cv2
+import numpy as np
 
 import torch
 from torchvision.utils import save_image
+from torchvision import transforms
+import torch.nn.functional as F
+from PIL import Image
 
 from model import WaveEncoder, WaveDecoder
 
 from utils.core import feature_wct
-from utils.io import Timer, open_image, load_segment, compute_label_info
+from utils.io import Timer, open_image, load_segment, compute_label_info, transform_ubfc_image
 
 
 IMG_EXTENSIONS = [
@@ -130,8 +135,83 @@ def get_all_transfer():
                     ret.append(_ret)
     return ret
 
+def get_seg(input_frame, model):
+    # Preprocess the input image
+    preprocess = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    input_tensor = preprocess(input_frame)
+    input_batch = input_tensor.unsqueeze(0)
 
-def run_bulk(config):
+    # Move the input and model to GPU for speed if available
+    if torch.cuda.is_available():
+        input_batch = input_batch.to('cuda')
+        model.to('cuda')
+
+    # Generate the output predictions
+    with torch.no_grad():
+        output = model(input_batch)['out'][0]
+    output_predictions = output.argmax(0)
+
+    # Create a color palette, selecting a color for each class
+    palette = torch.tensor([2 ** 25 - 1, 2 ** 15 - 1, 2 ** 21 - 1])
+    colors = torch.as_tensor([i for i in range(21)])[:, None] * palette
+    colors = (colors % 255).numpy().astype("uint8")
+
+    # Plot the semantic segmentation predictions of 21 classes in each color
+    r = Image.fromarray(output_predictions.byte().cpu().numpy()).resize((input_frame.shape[1], input_frame.shape[0]))
+    r.putpalette(colors)
+
+    return r
+
+# Resize back to original size
+def resize_to_original(frame, width, height):
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+def face_detection(frame, use_larger_box=False, larger_box_coef=1.0):
+    """Face detection on a single frame.
+    Args:
+        frame(np.array): a single frame.
+        use_larger_box(bool): whether to use a larger bounding box on face detection.
+        larger_box_coef(float): Coef. of larger box.
+    Returns:
+        face_box_coor(List[int]): coordinates of face bouding box.
+    """
+    detector = cv2.CascadeClassifier('/playpen-nas-ssd/akshay/UNC_Google_Physio/MA-rPPG-Video-Toolbox/utils/haarcascade_frontalface_default.xml')
+    face_zone = detector.detectMultiScale(frame)
+    if len(face_zone) < 1:
+        print("ERROR: No Face Detected")
+        face_box_coor = [0, 0, frame.shape[0], frame.shape[1]]
+    elif len(face_zone) >= 2:
+        face_box_coor = np.argmax(face_zone, axis=0)
+        face_box_coor = face_zone[face_box_coor[2]]
+        print("Warning: More than one faces are detected(Only cropping the biggest one.)")
+    else:
+        face_box_coor = face_zone[0]
+    if use_larger_box:
+        face_box_coor[0] = max(0, face_box_coor[0] - (larger_box_coef - 1.0) / 2 * face_box_coor[2])
+        face_box_coor[1] = max(0, face_box_coor[1] - (larger_box_coef - 1.0) / 2 * face_box_coor[3])
+        face_box_coor[2] = larger_box_coef * face_box_coor[2]
+        face_box_coor[3] = larger_box_coef * face_box_coor[3]
+    return face_box_coor
+
+def read_ubfc_video(video_file):
+        """Reads a video file, returns frames(T,H,W,3) """
+        VidObj = cv2.VideoCapture(video_file)
+        VidObj.set(cv2.CAP_PROP_POS_MSEC, 0)
+        success, frame = VidObj.read()
+        frames = list()
+        while success:
+            frame = cv2.cvtColor(np.array(frame), cv2.COLOR_BGR2RGB)
+            frame = np.asarray(frame)
+            frames.append(frame)
+            success, frame = VidObj.read()
+        print(np.shape(frames))
+        return np.asarray(frames)
+
+def run_bulk(config, model):
+
     device = 'cpu' if config.cpu or not torch.cuda.is_available() else 'cuda:0'
     device = torch.device(device)
 
@@ -143,48 +223,105 @@ def run_bulk(config):
     if config.transfer_at_skip:
         transfer_at.add('skip')
 
-    # The filenames of the content and style pair should match
-    fnames = set(os.listdir(config.content)) & set(os.listdir(config.style))
+    # # The filenames of the content and style pair should match
+    # fnames = set(os.listdir(config.content)) & set(os.listdir(config.style))
 
-    if config.content_segment and config.style_segment:
-        fnames &= set(os.listdir(config.content_segment))
-        fnames &= set(os.listdir(config.style_segment))
+    # if config.content_segment and config.style_segment:
+    #     fnames &= set(os.listdir(config.content_segment))
+    #     fnames &= set(os.listdir(config.style_segment))
 
-    for fname in tqdm.tqdm(fnames):
-        if not is_image_file(fname):
-            print('invalid file (is not image), ', fname)
-            continue
-        _content = os.path.join(config.content, fname)
-        _style = os.path.join(config.style, fname)
-        _content_segment = os.path.join(config.content_segment, fname) if config.content_segment else None
-        _style_segment = os.path.join(config.style_segment, fname) if config.style_segment else None
-        _output = os.path.join(config.output, fname)
+    # for fname in tqdm.tqdm(fnames):
+    #     if not is_image_file(fname):
+    #         print('invalid file (is not image), ', fname)
+    #         continue
+    # _content = os.path.join(config.content, fname)
+    # _style = os.path.join(config.style, fname)
+    # _content_segment = os.path.join(config.content_segment, fname) if config.content_segment else None
+    # _style_segment = os.path.join(config.style_segment, fname) if config.style_segment else None
+    # _output = os.path.join(config.output, fname)
 
-        content = open_image(_content, config.image_size).to(device)
-        style = open_image(_style, config.image_size).to(device)
-        content_segment = load_segment(_content_segment, config.image_size)
-        style_segment = load_segment(_style_segment, config.image_size)     
-        _, ext = os.path.splitext(fname)
+    # content = open_image(config.content, config.image_size).to(device)
+    content = read_ubfc_video(config.content)
+
+    cropped_frames = []
+    face_region_all = []
+
+    # First, compute the median bounding box across all frames
+    for frame in content:
+        face_box = face_detection(frame, True, 2.0) # MAUBFC and others
+        face_region_all.append(face_box)
+    face_region_all = np.asarray(face_region_all, dtype='int')
+    face_region_median = np.median(face_region_all, axis=0).astype('int')
+
+    # Apply the median bounding box for cropping and subsequent resizing
+    for frame in content:
+        cropped_frame = frame[int(face_region_median[1]):int(face_region_median[1]+face_region_median[3]),
+                            int(face_region_median[0]):int(face_region_median[0]+face_region_median[2])]
+        resized_frame = resize_to_original(cropped_frame, np.shape(content)[2], np.shape(content)[1])
+        cropped_frames.append(resized_frame)
+
+    content = cropped_frames
+    # copy_of_np_content = content
+    # print(np.shape(content))
+
+    restyled_video = []    
+    frame_count = np.shape(content)[0]
+    frames_pbar = tqdm(list(range(frame_count)))
+
+    for frame in content:
+        content_frame = transform_ubfc_image(Image.fromarray(frame)).to(device)
+        style = open_image(config.style, config.image_size).to(device)
+        # content_seg = get_seg(cv2.cvtColor(cv2.imread(config.content), cv2.COLOR_BGR2RGB), model)
+        content_seg = get_seg(frame, model)
+        style_seg = get_seg(cv2.cvtColor(cv2.imread(config.style), cv2.COLOR_BGR2RGB), model)
+        content_segment = load_segment(content_seg, config.image_size)
+        style_segment = load_segment(style_seg, config.image_size)     
+        # _, ext = os.path.splitext(config.content)
+        # _output = os.path.join(config.output, "Test.png")
+
+        save_image(content_frame.clamp_(0, 1), os.path.join(config.output, "content_frame_debug.png"), padding=0)
+        save_image(style.clamp_(0, 1), os.path.join(config.output, "style_debug.png"), padding=0)
         
         if not config.transfer_all:
             with Timer('Elapsed time in whole WCT: {}', config.verbose):
-                postfix = '_'.join(sorted(list(transfer_at)))
-                fname_output = _output.replace(ext, '_{}_{}.{}'.format(config.option_unpool, postfix, ext))
-                print('------ transfer:', _output)
+                # postfix = '_'.join(sorted(list(transfer_at)))
+                # fname_output = _output.replace(ext, '_{}_{}{}'.format(config.option_unpool, postfix, ext))
+                # print('------ transfer:', _output)
                 wct2 = WCT2(transfer_at=transfer_at, option_unpool=config.option_unpool, device=device, verbose=config.verbose)
                 with torch.no_grad():
-                    img = wct2.transfer(content, style, content_segment, style_segment, alpha=config.alpha)
-                save_image(img.clamp_(0, 1), fname_output, padding=0)
-        else:
-            for _transfer_at in get_all_transfer():
-                with Timer('Elapsed time in whole WCT: {}', config.verbose):
-                    postfix = '_'.join(sorted(list(_transfer_at)))
-                    fname_output = _output.replace(ext, '_{}_{}.{}'.format(config.option_unpool, postfix, ext))
-                    print('------ transfer:', fname)
-                    wct2 = WCT2(transfer_at=_transfer_at, option_unpool=config.option_unpool, device=device, verbose=config.verbose)
-                    with torch.no_grad():
-                        img = wct2.transfer(content, style, content_segment, style_segment, alpha=config.alpha)
-                    save_image(img.clamp_(0, 1), fname_output, padding=0)
+                    img = wct2.transfer(content_frame, style, content_segment, style_segment, alpha=config.alpha)
+                # save_image(img.clamp_(0, 1), fname_output, padding=0)
+        img = F.interpolate(img, size=(480, 640), mode='area')
+        img = img.clamp_(0, 1)
+        # save_image(img, os.path.join(config.output, "output_debug_resized.png"), padding=0)
+        img = img.squeeze(0).cpu().numpy().transpose(1, 2, 0)
+        img = (img * 255).astype(np.uint8)
+        restyled_video.append(img)
+        frames_pbar.update(1)
+    frames_pbar.close()
+    save_path = os.path.join(config.output, "Test.npy")
+    np.save(save_path, restyled_video)
+
+    # Write the video as an mp4 file
+    out_path = os.path.join(config.output, "Test.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    height, width, _ = restyled_video[0].shape
+    out = cv2.VideoWriter(out_path, fourcc, 30.0, (width, height))
+    for frame in restyled_video:
+        out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    out.release()
+
+    cv2.imwrite(os.path.join(config.output, "Test_debug.png"), cv2.cvtColor(restyled_video[777], cv2.COLOR_RGB2BGR))
+    # else:
+    #     for _transfer_at in get_all_transfer():
+    #         with Timer('Elapsed time in whole WCT: {}', config.verbose):
+    #             postfix = '_'.join(sorted(list(_transfer_at)))
+    #             fname_output = _output.replace(ext, '_{}_{}.{}'.format(config.option_unpool, postfix, ext))
+    #             print('------ transfer:', fname)
+    #             wct2 = WCT2(transfer_at=_transfer_at, option_unpool=config.option_unpool, device=device, verbose=config.verbose)
+    #             with torch.no_grad():
+    #                 img = wct2.transfer(content, style, content_segment, style_segment, alpha=config.alpha)
+    #             save_image(img.clamp_(0, 1), fname_output, padding=0)
 
 
 if __name__ == '__main__':
@@ -207,10 +344,16 @@ if __name__ == '__main__':
 
     print(config)
 
+    # Load the segmentation model on GPU device 2
+    device = torch.device('cuda:2')
+    model = torch.hub.load('pytorch/vision:v0.9.2', 'deeplabv3_resnet50', pretrained=True)
+    model.to(device)
+    model.eval()
+
     if not os.path.exists(os.path.join(config.output)):
         os.makedirs(os.path.join(config.output))
 
     '''
     CUDA_VISIBLE_DEVICES=6 python transfer.py --content ./examples/content --style ./examples/style --content_segment ./examples/content_segment --style_segment ./examples/style_segment/ --output ./outputs/ --verbose --image_size 512 -a
     '''
-    run_bulk(config)
+    run_bulk(config, model)
